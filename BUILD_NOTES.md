@@ -1,5 +1,27 @@
 # RiftStack Emmy Hackathon 2026 — build notes
 
+## Fixes (Oct 24, verified on the RTX 5090 runner — 15/15 PASS)
+
+Three compiler bugs fixed in `emmy-ptx/compile.py` (runner went 4/15 → 15/15):
+
+1. **Shared-memory base registers were defined lazily on first use.** When the
+   first use sat inside a predicated region (`if (lane == 0)` smem writes in
+   r01/r02/r03/r04/f01/f03/f02; a `StridedLoop` some threads skip entirely in
+   m02), threads skipping the region read an undefined base register →
+   `cudaErrorMisalignedAddress` / `cudaErrorIllegalAddress`. Fix: hoist every
+   smem buffer's base-address `mov` into the prologue, unconditionally.
+2. **Loop-carried accumulators never accumulated.** `stmt_Accum` wrote each
+   iteration's result to a *fresh* register, but the loop body is emitted once
+   and re-executed, so every trip read the pre-loop register — only the last
+   iteration's contribution survived (m01 err 1.1e+02, a01/a02 err ~2.5).
+   (The runner's "parameters must be in arg_order" hint on these FAILs was a
+   red herring — params were already in arg_order.) Fix: `Accum` now updates
+   the accumulator's own register in place, like the loop counter does.
+3. **Wrong `exp` constant.** The f32 `log2(e)` multiplier was `0f3FC62C6D`
+   (= 1.5482) instead of `0f3FB8AA3B` (= 1.44269504…), a ~7% error in the
+   exponent — broke all `exp` users (f02/a01/a02 online softmax). The f64
+   constant was already correct.
+
 Compiler: `emmy-ptx/compile.py` — contract `python compile.py <kernel>.ir.json > out.ptx`.
 Own lowering throughout (recursive descent over Emmy Kernel IR statements, PTX text
 emitted directly). Emmy is used ONLY to load the IR (`Graph.from_dict`) plus `meta.json`

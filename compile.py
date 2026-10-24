@@ -307,9 +307,13 @@ class Emitter:
         return a
 
     # -- elementwise ops ----------------------------------------------------
-    def emit_elementwise(self, ptype, op, args):
-        """args: list of (reg, ptype). Returns (reg, ptype) of result."""
-        d = self.newreg(ptype)
+    def emit_elementwise(self, ptype, op, args, dest=None):
+        """args: list of (reg, ptype). Returns (reg, ptype) of result.
+
+        dest: optional pre-existing register to write the result into
+        (in-place update). Used by Accum: see stmt_Accum.
+        """
+        d = dest if dest is not None else self.newreg(ptype)
         a = [r for r, _ in args]
         if op == "add":
             self.emit("add.%s %s, %s, %s;" % (ptype, d, a[0], a[1]))
@@ -347,10 +351,10 @@ class Emitter:
             else:
                 raise ValueError("reciprocal on " + ptype)
         elif op == "exp":
-            # e^x = 2^(x * log2(e))
+            # e^x = 2^(x * log2(e)); log2(e) = 0f3FB8AA3B in f32
             if ptype == "f32":
                 t = self.newreg("f32")
-                self.emit("mul.f32 %s, %s, 0f3FC62C6D;" % (t, a[0]))
+                self.emit("mul.f32 %s, %s, 0f3FB8AA3B;" % (t, a[0]))
                 self.emit("ex2.approx.f32 %s, %s;" % (d, t))
             elif ptype == "f64":
                 t = self.newreg("f64")
@@ -520,7 +524,16 @@ class Emitter:
         base = s.base if s.base is not None else s.name
         breg, btype = self.env[base]
         vreg, vtype = self.env[s.value]
-        d, t = self.emit_elementwise(btype, op, [(breg, btype), (vreg, vtype)])
+        dreg, dtype = self.env[s.name]
+        # In-place update of the accumulator's own register. The loop body is
+        # emitted once as PTX text and re-executed every trip, so writing to a
+        # fresh register would keep reading the pre-loop value on every
+        # iteration and the accumulator would never actually accumulate (only
+        # the last iteration's contribution would survive). Updating the
+        # accumulator register itself carries the value across iterations,
+        # exactly like the loop counter does.
+        d, t = self.emit_elementwise(btype, op, [(breg, btype), (vreg, vtype)],
+                                     dest=dreg)
         self.env[s.name] = (d, t)
 
     def accums_in(self, body):
@@ -876,6 +889,16 @@ class Emitter:
         self.emit("shr.u32 %s, %s, 5;" % (warp, tid))
         self.env["lane"] = (lane, "s32")
         self.env["warp"] = (warp, "s32")
+
+        # Hoist shared-memory base addresses: define every buffer's base
+        # register unconditionally up front. The first use of a buffer can sit
+        # inside a predicated region -- e.g. `if (lane == 0)` smem writes, or a
+        # StridedLoop whose start >= extent on some threads -- which would
+        # leave the base register undefined on the threads that skip it, so
+        # every later shared access through it faults (misaligned/illegal
+        # address). smem_base_reg caches per buffer, so later uses reuse these.
+        for _sname, _ssize, _salign in self.smem_info:
+            self.smem_base_reg(_sname)
 
         # tile body (also inits loop-free accumulators, if any)
         self.init_accums(tile.body)
